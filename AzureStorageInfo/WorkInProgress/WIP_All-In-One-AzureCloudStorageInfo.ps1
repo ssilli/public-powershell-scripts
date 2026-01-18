@@ -1,156 +1,141 @@
-# Check if the Az module is installed and install it if necessary
-if (-not (Get-Module -ListAvailable -Name Az)) {
-    Install-Module -Name Az -Scope CurrentUser -Repository PSGallery -Force
-}
+# Requires Az module and ImportExcel (Install-Module ImportExcel if needed)
+# Run as: .\AzureFootprintReport.ps1 -OutputPath "C:\Temp\AzureFootprint.xlsx"
 
-# Import the Az module
+param (
+    [string]$OutputPath = "AzureFootprint.xlsx"
+)
+
+# Install/Check modules (comment out if already done)
+if (-not (Get-Module -ListAvailable -Name Az)) { Install-Module Az -Scope CurrentUser -Force }
+if (-not (Get-Module -ListAvailable -Name ImportExcel)) { Install-Module ImportExcel -Scope CurrentUser -Force }
+
 Import-Module Az
 Import-Module ImportExcel
 
-# Connect to Azure
+# Connect (interactive or use service principal if automated)
 Connect-AzAccount
 
-# Get all subscriptions in the tenant
 $subscriptions = Get-AzSubscription
 
-# Initialize the Excel file
-$excelPath = "AzureStorageInfo.xlsx"
-
-# Function to write data to Excel
+# Function to write to Excel
 function WriteTo-Excel {
-    param (
-        [array]$data,
-        [string]$sheetName
-    )
-    $data | Export-Excel -Path $excelPath -WorkSheetname $sheetName -AutoSize -Append
-}
-
-# Script 1: Collect Azure Blob Storage Info
-$blobStorageData = @()
-foreach ($subscription in $subscriptions) {
-    Set-AzContext -SubscriptionId $subscription.Id
-    $storageAccounts = Get-AzStorageAccount
-
-    foreach ($account in $storageAccounts) {
-        $ctx = $account.Context
-        $totalSizeGB = 0
-        $containerCount = 0
-
-        try {
-            $containers = Get-AzStorageContainer -Context $ctx -WarningAction SilentlyContinue
-            $containerCount = $containers.Count
-
-            foreach ($container in $containers) {
-                $blobs = Get-AzStorageBlob -Container $container.Name -Context $ctx -WarningAction SilentlyContinue
-                foreach ($blob in $blobs) {
-                    $totalSizeGB += $blob.Length / 1GB
-                }
-            }
-        } catch {
-            Write-Host "Skipping storage account due to an error: $($account.StorageAccountName)"
-            continue
-        }
-
-        $blobStorageData += [PSCustomObject]@{
-            SubscriptionName = $subscription.Name
-            NumberOfContainers = $containerCount
-            Location = $account.PrimaryLocation
-            TotalConsumedDataGB = [math]::Round($totalSizeGB, 2)
-        }
-
-        # Write to Excel in batches to save memory
-        if ($blobStorageData.Count -ge 100) {
-            WriteTo-Excel -data $blobStorageData -sheetName "Blob Storage"
-            $blobStorageData = @()  # Reset the array
-        }
+    param ([array]$data, [string]$sheetName)
+    if ($data.Count -gt 0) {
+        $data | Export-Excel -Path $OutputPath -WorksheetName $sheetName -AutoSize -Append -FreezeTopRow
     }
 }
 
-# Write any remaining data to Excel
-if ($blobStorageData.Count -gt 0) {
-    WriteTo-Excel -data $blobStorageData -sheetName "Blob Storage"
-}
+# Clear file if exists
+if (Test-Path $OutputPath) { Remove-Item $OutputPath }
 
-# Script 2: Collect Azure Databases Storage Info
-$databasesStorageData = @()
-foreach ($subscription in $subscriptions) {
-    Set-AzContext -SubscriptionId $subscription.Id
-    $sqlServers = Get-AzSqlServer
+Write-Host "Starting Azure footprint report..."
 
-    foreach ($server in $sqlServers) {
+# Blob/Storage Account Usage (using metrics for actual consumed)
+$storageData = @()
+foreach ($sub in $subscriptions) {
+    Set-AzContext -SubscriptionId $sub.Id | Out-Null
+    $accounts = Get-AzStorageAccount
+
+    foreach ($acct in $accounts) {
         try {
-            $databases = Get-AzSqlDatabase -ServerName $server.ServerName -ResourceGroupName $server.ResourceGroupName
-            $totalSizeGB = 0
+            $metric = Get-AzMetric -ResourceId $acct.Id -MetricName "UsedCapacity" -WarningAction SilentlyContinue
+            $usedBytes = ($metric.Data | Select-Object -Last 1).Average  # Latest value
+            $usedGB = if ($usedBytes) { [math]::Round($usedBytes / 1GB, 2) } else { 0 }
 
-            foreach ($db in $databases) {
-                $dbSize = (Get-AzSqlDatabase -ResourceGroupName $server.ResourceGroupName -ServerName $server.ServerName -DatabaseName $db.DatabaseName).MaxSizeBytes / 1GB
-                $totalSizeGB += $dbSize
+            $storageData += [PSCustomObject]@{
+                Subscription   = $sub.Name
+                StorageAccount = $acct.StorageAccountName
+                ResourceGroup  = $acct.ResourceGroupName
+                Location       = $acct.Location
+                UsedGB         = $usedGB
+                Kind           = $acct.Kind
+            }
 
-                $databasesStorageData += [PSCustomObject]@{
-                    SubscriptionName = $subscription.Name
-                    SQLServerName = $server.ServerName
-                    DatabaseName = $db.DatabaseName
-                    ResourceGroup = $server.ResourceGroupName
-                    NumberOfDatabases = $databases.Count
-                    Location = $server.Location
-                    TotalConsumedDataGB = [math]::Round($totalSizeGB, 2)
-                }
-
-                # Write to Excel in batches to save memory
-                if ($databasesStorageData.Count -ge 100) {
-                    WriteTo-Excel -data $databasesStorageData -sheetName "Databases Storage"
-                    $databasesStorageData = @()  # Reset the array
-                }
+            if ($storageData.Count -ge 50) {
+                WriteTo-Excel -data $storageData -sheetName "StorageAccounts"
+                $storageData = @()
             }
         } catch {
-            Write-Host "Skipping SQL server due to an error: $($server.ServerName)"
-            continue
+            Write-Host "Skip storage $($acct.StorageAccountName): $_"
         }
     }
 }
+if ($storageData.Count -gt 0) { WriteTo-Excel -data $storageData -sheetName "StorageAccounts" }
 
-# Write any remaining data to Excel
-if ($databasesStorageData.Count -gt 0) {
-    WriteTo-Excel -data $databasesStorageData -sheetName "Databases Storage"
+# SQL Databases (used from metrics, max from object)
+$dbData = @()
+foreach ($sub in $subscriptions) {
+    Set-AzContext -SubscriptionId $sub.Id | Out-Null
+    $servers = Get-AzSqlServer
+
+    foreach ($server in $servers) {
+        try {
+            $dbs = Get-AzSqlDatabase -ResourceGroupName $server.ResourceGroupName -ServerName $server.ServerName | Where-Object { $_.DatabaseName -ne "master" }
+
+            foreach ($db in $dbs) {
+                $metric = Get-AzMetric -ResourceId $db.ResourceId -MetricName "storage" -WarningAction SilentlyContinue
+                $usedBytes = ($metric.Data | Select-Object -Last 1).Maximum  # Often max recent for used
+                $usedGB = if ($usedBytes) { [math]::Round($usedBytes / 1GB, 2) } else { 0 }
+                $maxGB = [math]::Round($db.MaxSizeBytes / 1GB, 2)
+
+                $dbData += [PSCustomObject]@{
+                    Subscription   = $sub.Name
+                    Server         = $server.ServerName
+                    Database       = $db.DatabaseName
+                    ResourceGroup  = $server.ResourceGroupName
+                    Location       = $server.Location
+                    UsedGB         = $usedGB
+                    MaxGB          = $maxGB
+                }
+
+                if ($dbData.Count -ge 50) {
+                    WriteTo-Excel -data $dbData -sheetName "Databases"
+                    $dbData = @()
+                }
+            }
+        } catch {
+            Write-Host "Skip SQL server $($server.ServerName): $_"
+        }
+    }
 }
+if ($dbData.Count -gt 0) { WriteTo-Excel -data $dbData -sheetName "Databases" }
 
-# Script 3: Collect Azure VM Storage Info
-$vmStorageData = @()
-foreach ($subscription in $subscriptions) {
-    Set-AzContext -SubscriptionId $subscription.Id
+# VMs (config disk sizes, not actual consumed)
+$vmData = @()
+foreach ($sub in $subscriptions) {
+    Set-AzContext -SubscriptionId $sub.Id | Out-Null
     $vms = Get-AzVM
 
     foreach ($vm in $vms) {
         try {
-            $vmStatus = Get-AzVM -Status -ResourceGroupName $vm.ResourceGroupName -Name $vm.Name
-            $powerState = $vmStatus.Statuses | Where-Object { $_.Code -match 'PowerState' } | Select-Object -ExpandProperty DisplayStatus
+            $vmStatus = Get-AzVM -ResourceGroupName $vm.ResourceGroupName -Name $vm.Name -Status
+            $power = ($vmStatus.Statuses | Where-Object { $_.Code -like "*PowerState*" }).DisplayStatus
 
-            if ($powerState -ne 'VM deallocated') {
-                $vmStorageData += [PSCustomObject]@{
-                    SubscriptionName = $subscription.Name
-                    VMName = $vm.Name
-                    VMSize = $vm.HardwareProfile.VmSize
-                    OSType = $vm.StorageProfile.OsDisk.OsType
-                    PowerState = $powerState
-                    Location = $vm.Location
-                }
+            if ($power -notlike "*deallocated*") {
+                $osDiskGB = [math]::Round($vm.StorageProfile.OsDisk.DiskSizeGB, 2)
+                $dataDisksGB = ($vm.StorageProfile.DataDisks | Measure-Object -Property DiskSizeGB -Sum).Sum
+                $totalDiskGB = $osDiskGB + $dataDisksGB
 
-                # Write to Excel in batches to save memory
-                if ($vmStorageData.Count -ge 100) {
-                    WriteTo-Excel -data $vmStorageData -sheetName "VM Storage"
-                    $vmStorageData = @()  # Reset the array
+                $vmData += [PSCustomObject]@{
+                    Subscription   = $sub.Name
+                    VMName         = $vm.Name
+                    Size           = $vm.HardwareProfile.VmSize
+                    PowerState     = $power
+                    Location       = $vm.Location
+                    TotalDiskGB    = [math]::Round($totalDiskGB, 2)
                 }
             }
+
+            if ($vmData.Count -ge 50) {
+                WriteTo-Excel -data $vmData -sheetName "VMs"
+                $vmData = @()
+            }
         } catch {
-            Write-Host "Skipping VM due to an error: $($vm.Name)"
-            continue
+            Write-Host "Skip VM $($vm.Name): $_"
         }
     }
 }
+if ($vmData.Count -gt 0) { WriteTo-Excel -data $vmData -sheetName "VMs" }
 
-# Write any remaining data to Excel
-if ($vmStorageData.Count -gt 0) {
-    WriteTo-Excel -data $vmStorageData -sheetName "VM Storage"
-}
-
-Write-Host "Data collection complete. Output written to $excelPath"
+Disconnect-AzAccount
+Write-Host "Done! Check $OutputPath for sheets: StorageAccounts, Databases, VMs"
